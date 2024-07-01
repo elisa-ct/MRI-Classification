@@ -1,0 +1,927 @@
+---
+title: "FROBENIUS RESUMEN"
+toc: true
+format:
+  html:
+    embed-resources: true
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+#| echo: false
+rm(list = ls())
+library(GLCMTextures) # para sacar la matriz GLCM
+library(imager) # para cargar las imágenes
+library(tidyverse)
+library(purrr)
+library(tidymodels)
+library(readr)
+library(ggplot2)
+library(corrplot)
+library(performance)
+library(FactoMineR)
+library(factoextra)
+library(ClustOfVar)
+library(rpart.plot)
+library(glue)
+library(caret)
+library(pROC)
+```
+
+## 1. Obtención de las matrices GLCM
+
+Los pasos del código que se muestra son los siguientes:
+
+1.  Cargamos las matrices de intensidades de los píxeles.
+
+2.  Definimos la función `manual_glcm` que nos devuelve las matrices.
+
+3.  Tras obtener las matrices GLCM de cada una de las imagenes MRI las guardamos por shift.
+
+```{r}
+#| eval: false
+non_demented <- read_rds(file = "./alzheimer-grey-images/non-demented.rds")
+names(non_demented) <- glue::glue("non_demented_{1:length(non_demented)}")
+
+moderate_demented <- read_rds(file = "./alzheimer-grey-images/moderate-demented.rds")
+names(moderate_demented) <- glue::glue("moderate_demented_{1:length(moderate_demented)}")
+
+very_mild_demented <- read_rds(file = "./alzheimer-grey-images/very-mild-demented.rds")
+names(very_mild_demented) <- glue::glue("very_mild_demented_{1:length(very_mild_demented)}")
+
+mild_demented <- read_rds(file = "./alzheimer-grey-images/mild-demented.rds")
+names(mild_demented) <- glue::glue("mild_demented_{1:length(mild_demented)}")
+
+# Juntamos todas
+mri_grey <- list(non_demented, moderate_demented, very_mild_demented, mild_demented)
+names(mri_grey) <- c("non_demented", "moderate_demented",
+                     "very_mild_demented", "mild_demented")
+
+# Ahorramos memoria
+rm(non_demented)
+rm(moderate_demented)
+rm(very_mild_demented)
+rm(mild_demented)
+```
+
+```{r}
+#| eval: false
+# Definimos funcion
+manual_glcm <- function(img_matrix, shift = c(1, 0), radius = NULL,
+                        normalize = FALSE, type = "cartesian") {
+  
+  n_levels <- length(unique(as.vector(img_matrix)))
+  
+  if (type == "cartesian") {
+
+      glcm_matrix <- 
+        GLCMTextures::make_glcm(img_matrix, n_levels = 256,
+                                shift = shift, normalize = normalize)
+    
+  } else if (type == "radial") {
+    
+    glcm_matrix <- matrix(0, nrow = 256, ncol = 256)
+    for (i in -radius:radius) {
+      for (j in -radius:radius) {
+        if (i !=0 | j != 0) {
+          
+          glcm_matrix <- 
+            glcm_matrix +
+            GLCMTextures::make_glcm(img_matrix, n_levels = 256,
+                                    shift = c(i, j), normalize = FALSE)
+        }
+      }
+    }
+    
+    glcm_matrix <- glcm_matrix / 2
+    
+    if (normalize) {
+      
+      glcm_matrix <- glcm_matrix / sum(glcm_matrix)
+      
+    }
+    
+  } else {
+    
+    stop("Just 'cartesian' and 'radial' values are allowed in type argument")
+  }
+  
+  return(glcm_matrix)
+}
+```
+
+```{r}
+#| eval: false
+# Definimos las categorías y los shifts
+categories <- c("non_demented", "moderate_demented", "very_mild_demented", "mild_demented")
+shifts <- list(c(1, 0), c(0, 1), c(1, 1), c(-1, 1), 1)
+
+# Función para calcular y guardar las matrices GLCM por categoría
+calcular_y_guardar_glcm <- function(category, shifts) {
+  cat("Processing category:", category, "\n")
+  
+  # Obtener las matrices de intensidad de píxeles de la categoría
+  img_matrices <- mri_grey[[category]]
+  
+  for (shift in shifts) {
+    shift_name <- if (length(shift) == 2) paste(shift, collapse = "-") else as.character(shift)
+    cat("  Processing shift:", shift_name, "\n")
+    
+    glcm_matrices <- map(img_matrices, function(img_matrix) {
+      if (length(shift) == 2) {
+        manual_glcm(img_matrix, shift = shift, normalize = TRUE)
+      } else {
+        manual_glcm(img_matrix, radius = shift, type = "radial", normalize = TRUE)
+      }
+    })
+    
+    # Guardar las matrices GLCM para el shift actual
+    saveRDS(glcm_matrices, file = glue("./alzheimer-glcm-matrices/{category}-glcm-{shift_name}.rds"))
+  }
+}
+
+# Calcular y guardar las matrices GLCM para cada categoría
+walk(categories, calcular_y_guardar_glcm, shifts = shifts)
+```
+
+Lo que hago ahora es cargar cada una de las listas de matrices de cada categoría para la dirección radial y asignar a cada una de ellas la categoría correspondiente. Después creamos una lista general para la dirección radial con dos elementos:
+
+-   Demented: todas las matrices de la categoría demented con su categoría correspondiente.
+
+-   Non demented: todas las matrices de la categoría non demented con su categoría correspondiente.
+
+Aunque se cree una lista con estas dos categorías cada elemento tendrá su categoría asociada, porque se necesitará luego para Frobenius. El crear una lista con las dos categorías dividas se hace para poder hacer la partición de los datos de train y test por categoría balanceada.
+
+```{r}
+#| eval: false
+# Leer las matrices GLCM para el shift r1
+glcm_non <- readRDS("./alzheimer-glcm-matrices/non_demented-glcm-1.rds")
+glcm_mild <- readRDS("./alzheimer-glcm-matrices/mild_demented-glcm-1.rds")
+glcm_very_mild<- readRDS("./alzheimer-glcm-matrices/very_mild_demented-glcm-1.rds")
+glcm_mod <- readRDS("./alzheimer-glcm-matrices/moderate_demented-glcm-1.rds")
+
+# Agregar la categoría a cada elemento de la lista
+add_category <- function(mat_list, category) {
+  lapply(mat_list, function(mat) list(matrix = mat, category = category))
+}
+
+glcm_non <- add_category(glcm_non, "non_demented")
+glcm_mild <- add_category(glcm_mild, "demented")
+glcm_very_mild <- add_category(glcm_very_mild, "demented")
+glcm_mod <- add_category(glcm_mod, "demented")
+
+glcm_r1 <- c(glcm_non, glcm_mild, glcm_very_mild, glcm_mod)
+saveRDS(glcm_r1, "./alzheimer-glcm-matrices/glcm_r1.rds")
+
+```
+
+```{r}
+#| eval: false
+# Crear una lista para almacenar las matrices GLCM, divididas por categoría
+glcm_r1 <- list(
+  demented = list(),
+  non_demented = list()
+)
+
+# Leer las matrices GLCM para el shift r1 y agregar la categoría correspondiente
+glcm_non <- readRDS("./alzheimer-glcm-matrices/non_demented-glcm-1.rds")
+glcm_demented <- readRDS("./alzheimer-glcm-matrices/mild_demented-glcm-1.rds")
+glcm_very_mild <- readRDS("./alzheimer-glcm-matrices/very_mild_demented-glcm-1.rds")
+glcm_mod <- readRDS("./alzheimer-glcm-matrices/moderate_demented-glcm-1.rds")
+
+glcm_r1$non_demented <- lapply(glcm_non, function(mat) list(matrix = mat, category = "non_demented"))
+glcm_r1$demented <- lapply(c(glcm_demented, glcm_very_mild, glcm_mod), function(mat) list(matrix = mat, category = "demented"))
+
+# Guardar la lista
+saveRDS(glcm_r1, "./alzheimer-glcm-matrices/glcm_r1.rds")
+
+rm(glcm_non, glcm_demented, glcm_mod, glcm_very_mild)
+```
+
+## 2. Frobenius con datos de prueba
+
+En esta parte se explica como se ha construido la función del KNN de Frobenius y se prueba con algunos datos. No se hace validación cruzada en esta prueba.
+
+Lo primero que hacemos es crear dos listas, una para cada categoría. De esta forma podemos hacer la partición en datos de entrenamiento y prueba de forma estratificada. Una vez hecha la partición unimos de nuevo las dos listas en una sola tanto para train como para test, que será con las que trabajemos.
+
+Por ahora no se ha hecho validación cruzada. La primera prueba va a ser solo con train y test.
+
+```{r}
+glcm_r1 <- readRDS("./alzheimer-glcm-matrices/glcm_r1.rds")
+```
+
+```{r}
+
+# Definir la proporción de datos de entrenamiento (80%)
+train_ratio <- 0.8
+
+# Dividir cada lista por categoría en datos de entrenamiento y prueba
+train_data <- test_data <- list()
+
+for (category in names(glcm_r1)) {
+  category_data <- glcm_r1[[category]]
+  n_samples <- length(category_data)
+  
+  # Determinar el número de muestras para entrenamiento y prueba
+  n_train <- round(n_samples * train_ratio)
+  n_test <- n_samples - n_train
+  
+  # Muestrear índices para entrenamiento y prueba
+  train_indexes <- sample(n_samples, n_train)
+  test_indexes <- setdiff(1:n_samples, train_indexes)
+  
+  # Dividir los datos en entrenamiento y prueba
+  train_data[[category]] <- category_data[train_indexes]
+  test_data[[category]] <- category_data[test_indexes]
+}
+
+# Combinar los datos de entrenamiento y prueba de ambas categorías
+train_data_combined <- do.call(c, train_data)
+test_data_combined <- do.call(c, test_data)
+
+rm(category_data, n_samples, n_train, n_test, train_indexes, test_indexes, train_data, test_data)
+```
+
+Una vez hemos hecho la partición, definimos la distancia de Frobenius. Luego definimos el KNN para esa distancia. Este KNN funciona según los siguientes pasos:
+
+1.  Introducimos los datos de trian, test y los valores del número de vecinos. En este caso se ha cogido un número reducido de datos y se ha hecho para k = 3 y 5.
+
+2.  Se calculan las distancias entre el nuevo punto de prueba (`test_item$matrix`) y todos los puntos de entrenamiento en `train_data`. La distancia de Frobenius se calcula entre cada par de matrices.
+
+3.  Se ordenan las distancias y se obtienen las etiquetas correspondientes a los puntos de entrenamiento más cercanos al nuevo punto de prueba. Para cada valor de k en `k_values`, se seleccionan las k etiquetas más cercanas.
+
+4.  Para cada valor de k en `k_values`, se calcula la predicción y la probabilidad de pertenecer a la clase más común entre las k etiquetas más cercanas. Se crea un marco de datos con estas predicciones, junto con el valor de k y la categoría real del punto de prueba.
+
+```{r}
+# Definir la función de distancia de Frobenius
+frobenius_distance <- function(mat1, mat2) {
+  sqrt(sum((mat1 - mat2)^2))
+}
+
+# Función FROB_KNN actualizada para incluir la categoría real del test data
+FROB_KNN <- function(train_data, test_data, k_values) {
+  predictions <- map_df(test_data, function(test_item) {
+    new_input_matrix <- test_item$matrix
+    distances <- map_dbl(train_data, ~ {
+      train_item_matrix <- .$matrix
+      frobenius_distance(train_item_matrix, new_input_matrix)
+    })
+    
+    sorted_indices <- order(distances)
+    sorted_labels <- map_chr(train_data[sorted_indices], ~ .$category)
+    closest_labels <- sorted_labels[1:max(k_values)]
+
+    result <- map_df(k_values, function(k) {
+      labels_k <- closest_labels[1:k]
+      most_frequent_label <- names(which.max(table(labels_k)))
+      probability <- sum(labels_k == "demented") / k
+      
+      data.frame(
+        k = k,
+        prediction = most_frequent_label,
+        probability = probability,
+        real_category = test_item$category
+      )
+    })
+    result
+  })
+  return(predictions)
+}
+```
+
+```{r}
+# Ejemplo de uso con datos variados
+set.seed(4567) # Para reproducibilidad
+random_indices <- sample(seq_along(train_data_combined), size = 16)
+train_data_varied <- train_data_combined[random_indices]
+test_indices <- sample(seq_along(test_data_combined), size = 4)
+test_data_varied <- test_data_combined[test_indices]
+
+# Ejecutar FROB_KNN con los datos variados y un k_value
+k_values <- c(3, 5) # Puedes probar con diferentes valores de k
+example_predictions <- FROB_KNN(train_data = train_data_varied, test_data = test_data_varied, k_values = k_values)
+
+# Verificar las predicciones
+print(example_predictions)
+```
+
+Una vez tenemos todas las predicciones almacenadas en un data frame calculamos la matriz de confusión para cada uno de los valores de k y calculamos por ahora las métricas: sensibilidad, especificidad y accuracy.
+
+```{r}
+#| message: false
+
+# Función para calcular la matriz de confusión y las métricas
+calculate_metrics <- function(predictions) {
+  # Asegurarse de que 'prediction' y 'real_category' sean factores con los mismos niveles
+  levels <- union(unique(predictions$prediction), unique(predictions$real_category))
+  predictions$prediction <- factor(predictions$prediction, levels = levels)
+  predictions$real_category <- factor(predictions$real_category, levels = levels)
+  
+  confusion <- confusionMatrix(data = predictions$prediction, reference = predictions$real_category)
+  
+  # Crear el data frame con todas las métricas
+  metrics <- data.frame(
+    sensitivity = confusion$byClass["Sensitivity"],
+    specificity = confusion$byClass["Specificity"],
+    accuracy = confusion$overall["Accuracy"],
+    kappa = confusion$overall["Kappa"]
+  )
+  return(metrics)
+}
+
+# Calcular AUC
+# Define una función para calcular el AUC
+calculate_auc <- function(predictions) {
+  roc_obj <- roc(ifelse(predictions$real_category == "demented", 1, 0), as.numeric(predictions$probability))
+  auc_value <- as.numeric(auc(roc_obj))
+  return(data.frame(AUC = auc_value))
+}
+
+# Calcular el AUC para cada valor de k
+AUC_df <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_auc(.))
+
+# Calcular las métricas para cada valor de k
+metrics <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_metrics(.))
+
+# Unir AUC con las métricas
+metrics <- left_join(metrics, AUC_df, by = "k")
+
+metrics
+```
+
+Hay que revisar cómo se calcula el AUC.
+
+## 3. Frobenius con todos los datos
+
+#### Validación cruzada
+
+Primero hacemos validación cruzada. Probamos k = 20, 50, 100, 200 por ahora. Los siguientes chunks tienen el código para:
+
+1.  Obtener las particiones para train y test.
+
+2.  Definir la distancia de Frobenius y el KNN.
+
+3.  Definir los 5 folds y 3 repeticiones de la validación cruzada, a partir de los datos de train.
+
+4.  Definir las funciones para la extracción de métricas de bondad de ajuste (de nuevo hay que revisar AUC).
+
+```{r}
+#| eval: false
+glcm_r1 <- readRDS("./alzheimer-glcm-matrices/glcm_r1.rds")
+
+# Definir la proporción de datos de entrenamiento (80%)
+train_ratio <- 0.8
+
+# Dividir cada lista por categoría en datos de entrenamiento y prueba
+train_data <- test_data <- list()
+
+for (category in names(glcm_r1)) {
+  category_data <- glcm_r1[[category]]
+  n_samples <- length(category_data)
+  
+  # Determinar el número de muestras para entrenamiento y prueba
+  n_train <- round(n_samples * train_ratio)
+  n_test <- n_samples - n_train
+  
+  # Muestrear índices para entrenamiento y prueba
+  train_indexes <- sample(n_samples, n_train)
+  test_indexes <- setdiff(1:n_samples, train_indexes)
+  
+  # Dividir los datos en entrenamiento y prueba
+  train_data[[category]] <- category_data[train_indexes]
+  test_data[[category]] <- category_data[test_indexes]
+}
+
+# Combinar los datos de entrenamiento y prueba de ambas categorías
+train_data_combined <- do.call(c, train_data)
+test_data_combined <- do.call(c, test_data)
+
+rm(category_data, n_samples, n_train, n_test, train_indexes, test_indexes, train_data, test_data)
+```
+
+```{r}
+#| eval: false
+# Definir la función de distancia de Frobenius
+frobenius_distance <- function(mat1, mat2) {
+  sqrt(sum((mat1 - mat2)^2))
+}
+
+# Función FROB_KNN actualizada para incluir la categoría real del test data
+FROB_KNN <- function(train_data, test_data, k_values) {
+  predictions <- map_df(test_data, function(test_item) {
+    new_input_matrix <- test_item$matrix
+    distances <- map_dbl(train_data, ~ {
+      train_item_matrix <- .$matrix
+      frobenius_distance(train_item_matrix, new_input_matrix)
+    })
+    
+    sorted_indices <- order(distances)
+    sorted_labels <- map_chr(train_data[sorted_indices], ~ .$category)
+    closest_labels <- sorted_labels[1:max(k_values)]
+
+    result <- map_df(k_values, function(k) {
+      labels_k <- closest_labels[1:k]
+      most_frequent_label <- names(which.max(table(labels_k)))
+      probability <- sum(labels_k == "demented") / k
+      
+      data.frame(
+        k = k,
+        prediction = most_frequent_label,
+        probability = probability,
+        real_category = test_item$category,
+        fold = test_item$fold,
+        repetition = test_item$repetition
+      )
+    })
+    result
+  })
+  return(predictions)
+}
+```
+
+```{r}
+#| eval: false
+k_values <- c(20, 50, 100, 200)
+
+# Crear las particiones de validación cruzada
+folds <- createMultiFolds(1:length(train_data_combined), k = 5, times = 3)
+```
+
+```{r}
+#| eval: false
+# Función para calcular la matriz de confusión y las métricas
+calculate_metrics <- function(predictions) {
+  # Asegurarse de que 'prediction' y 'real_category' sean factores con los mismos niveles
+  levels <- union(unique(predictions$prediction), unique(predictions$real_category))
+  predictions$prediction <- factor(predictions$prediction, levels = levels)
+  predictions$real_category <- factor(predictions$real_category, levels = levels)
+  
+  confusion <- confusionMatrix(data = predictions$prediction, reference = predictions$real_category)
+  
+  # Crear el data frame con todas las métricas
+  metrics <- data.frame(
+    sensitivity = confusion$byClass["Sensitivity"],
+    specificity = confusion$byClass["Specificity"],
+    accuracy = confusion$overall["Accuracy"],
+    kappa = confusion$overall["Kappa"]
+  )
+  return(metrics)
+}
+
+# Calcular AUC
+# Define una función para calcular el AUC
+calculate_auc <- function(predictions) {
+  roc_obj <- roc(ifelse(predictions$real_category == "demented", 1, 0), as.numeric(predictions$probability))
+  auc_value <- as.numeric(auc(roc_obj))
+  return(data.frame(AUC = auc_value))
+}
+```
+
+A continuación se muestra el código que se ha usado para obtener todos los resultados de la validación cruzada. El código es un poco diferente del de la prueba con datos reducidos, ya que en este caso se ha iterado por cada uno de los folds. Además en este caso no se almacenan todos los resultados de cada una de las clasificaciones, si no que se almacena directamente las métricas de cada una de las iteraciones de la validación cruzada.
+
+Explico el código paso por paso:\
+
+1.  **Inicialización de DataFrames Vacíos**: Se crean dataframes vacíos para almacenar las métricas de la matriz de confusión y el AUC de todos los folds y repeticiones.
+
+2.  **Iteración sobre cada repetición y fold**: Se itera sobre cada fold utilizando `seq_along(folds)`, donde `folds` es una lista de índices de los datos de entrenamiento y validación.
+
+3.  **Separar datos de entrenamiento y validación para este fold**: Se separan los datos en `train_fold` y `validation_fold` basados en los índices de los folds.
+
+4.  **Añadir información del fold y repetición a los datos de validación**: Se añade información del fold (`i %% 5`) y repetición (`ceiling(i / 5)`) a los datos de validación.
+
+5.  **Imprimir mensaje sobre el fold, la repetición y el valor de k**: Se imprime un mensaje que muestra el fold actual, la repetición y los valores de k.
+
+6.  **Ejecutar FROB_KNN con los datos del fold**: Se ejecuta el clasificador FROB_KNN con los datos de entrenamiento y validación, y los valores de k especificados.
+
+7.  **Calcular las métricas de la matriz de confusión para las predicciones del fold**: Se calculan las métricas de la matriz de confusión agrupando por el valor de k utilizando la función `calculate_metrics`.
+
+8.  **Añadir información de fold y repetición a las métricas de la matriz de confusión**: Se añade la información del fold y la repetición a las métricas de la matriz de confusión.
+
+9.  **Calcular el AUC para las predicciones del fold**: Se calcula el AUC para las predicciones agrupando por el valor de k utilizando la función `calculate_auc`.
+
+10. **Añadir información de fold y repetición al AUC**: Se añade la información del fold y la repetición al AUC.
+
+11. **Convertir `metrics_auc` a dataframe**: Se convierte `metrics_auc` a un tibble y se asegura de que el AUC sea de tipo `double`.
+
+12. **Agregar las métricas calculadas al dataframe general**: Se agregan las métricas calculadas para la matriz de confusión y el AUC a los dataframes generales.
+
+```{r}
+#| eval: false
+# Inicializar dataframes vacíos para almacenar las métricas de la matriz de confusión y el AUC
+all_metrics_confusion <- data.frame()
+all_metrics_auc <- data.frame()
+
+# Iterar sobre cada repetición y fold
+for (i in seq_along(folds)) {
+  fold_indices <- folds[[i]]
+  
+  # Separar datos de entrenamiento y validación para este fold
+  train_fold <- train_data_combined[fold_indices]
+  validation_fold <- train_data_combined[-fold_indices]
+  
+  # Añadir información del fold y repetición a los datos de validación
+  validation_fold <- map(validation_fold, ~ c(.x, list(fold = i %% 5, repetition = ceiling(i / 5))))
+  
+  # Imprimir mensaje sobre el fold, la repetición y el valor de k
+  cat("Fold:", i %% 5, "Repetición:", ceiling(i / 5), "k:", k_values, "\n")
+  
+  # Ejecutar FROB_KNN con los datos del fold
+  example_predictions <- FROB_KNN(train_data = train_fold, test_data = validation_fold, k_values)
+  
+  # Calcular las métricas de la matriz de confusión para las predicciones del fold
+  metrics_confusion <- example_predictions |> 
+    group_by(k) |> 
+    do(calculate_metrics(.))
+  
+  # Añadir información de fold y repetición a las métricas de la matriz de confusión
+  metrics_confusion$fold <- rep(i %% 5, nrow(metrics_confusion))
+  metrics_confusion$repetition <- rep(ceiling(i / 5), nrow(metrics_confusion))
+ 
+  # Calcular el AUC para las predicciones del fold
+  metrics_auc <- example_predictions |> 
+    group_by(k) |> 
+    do(calculate_auc(.))
+  
+  # Añadir información de fold y repetición al AUC
+  metrics_auc$fold <- rep(i %% 5, nrow(metrics_auc))
+  metrics_auc$repetition <- rep(ceiling(i / 5), nrow(metrics_auc))
+  
+  # Convertir metrics_auc a dataframe para que tenga el mismo formato que metrics_confusion
+  metrics_auc <- as_tibble(metrics_auc) |> 
+    mutate(AUC = as.double(AUC))
+  
+  # Agregar las métricas de la matriz de confusión y el AUC calculadas al dataframe general
+  all_metrics_confusion <- bind_rows(all_metrics_confusion, metrics_confusion)
+  all_metrics_auc <- bind_rows(all_metrics_auc, metrics_auc)
+}
+
+# Verificar las primeras filas de los dataframes de métricas para comprobar la información de fold y repetición
+head(all_metrics_confusion)
+head(all_metrics_auc)
+
+```
+
+```{r}
+#| eval: false
+metrics_KNN_glcm <- list(all_metrics_confusion_saved = all_metrics_confusion,
+                         all_metrics_auc_saved = all_metrics_auc)
+
+save(metrics_KNN_glcm, file = "./metricas/metrics_KNN_glcm.RData")
+```
+
+A continuación lo que hago es calcular las medias de las métricas de validación por cada uno de los valores de k para ver cuál es la que mayor accuracy tiene.
+
+```{r}
+load("./metricas/metrics_KNN_glcm.RData")
+
+all_metrics_confusion <- metrics_KNN_glcm$all_metrics_confusion_saved
+
+all_metrics_auc <- metrics_KNN_glcm$all_metrics_auc_saved
+
+all_metrics <- left_join(all_metrics_confusion, all_metrics_auc, by = c("k", "fold", "repetition"))
+
+# Calcular la media de cada métrica agrupada por k
+mean_metrics <- all_metrics |> 
+  group_by(k) |> 
+  summarize(
+    mean_sensitivity = mean(sensitivity),
+    mean_specificity = mean(specificity),
+    mean_accuracy = mean(accuracy),
+    mean_kappa = mean(kappa),
+    mean_AUC = mean(AUC)
+  ) |> 
+  ungroup() |> 
+  arrange(desc(mean_accuracy))  
+
+# Ver las medias de las métricas ordenadas
+head(mean_metrics)
+```
+
+Parece que la mejor opción es la de k = 50.
+
+Hacemos los boxplots de los mejores modelos, solamente hay 4 modelos diferentes porque hay no hay combinaciones de distancias y ponderaciones, solamente tenemos 4 k diferentes.
+
+```{r}
+colores <- c("#BC8F8F","#5F9EA0", "#8B0000", "#A188A6")
+```
+
+```{r}
+
+# ordenar los modelos por media de accuracy
+best_model_metrics <- all_metrics |> 
+  mutate(model = factor(k, levels = mean_metrics$k))
+
+# Crear el gráfico con ggplot2
+ggplot(best_model_metrics, aes(x = model, y = accuracy, fill = model, color = model)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, size = 1, outlier.shape = NA) +
+  gghalves::geom_half_point(side = "l", range_scale = .3, alpha = 0.5, size = 1) +
+  theme_minimal() +
+  labs(y = "Accuracy", x = "Valores de k") +
+  scale_fill_manual(values = colores) +
+  scale_color_manual(values = colores) +
+  theme(axis.text.x = element_text(angle = 90), legend.position = "none") +
+  labs(title = "Los modelos de validación cruzada KNN Frobenius", subtitle = "obtenidos a partir del dataset glcm radial")
+```
+
+```{r}
+
+best_model_metrics <- all_metrics |> 
+  filter(k == "50") |> 
+  select(sensitivity, specificity, accuracy, kappa, AUC) |> 
+  pivot_longer(cols = everything(),names_to = "metric", values_to = "estimate")
+
+colores_box <- c( "#59546C", "#D2B48C", "#BC8F8F", "#5F9EA0",  "#CD5C5C")
+
+ggplot(best_model_metrics, aes(x = metric, y = estimate, fill = metric, color = metric)) +
+  geom_boxplot(alpha = 0.4, width = 0.65, size = 0.7,
+               outlier.shape = NA) +
+  geom_jitter(alpha = 0.8, size = 1.5) +
+  scale_fill_manual(values = colores_box) +
+  scale_color_manual(values = colores_box) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  theme(legend.position = "none") +
+  labs(title = "Métricas de Validación del Mejor Modelo KNN Frobenius para glcm radial",
+       subtitle = "Modelo k = 50",
+       x = "Métrica",
+       y = "Valor",
+       fill = "Métrica")
+
+# Calcular la media y el error estándar de cada métrica
+metrics_summary <- all_metrics |> 
+  filter(k == "50") |> 
+  summarize(
+    sensitivity_mean = mean(sensitivity),
+    sensitivity_se = sd(sensitivity) / sqrt(n()),
+    specificity_mean = mean(specificity),
+    specificity_se = sd(specificity) / sqrt(n()),
+    accuracy_mean = mean(accuracy),
+    accuracy_se = sd(accuracy) / sqrt(n()),
+    kappa_mean = mean(kappa),
+    kappa_se = sd(kappa) / sqrt(n()),
+    AUC_mean = mean(AUC),
+    AUC_se = sd(AUC) / sqrt(n())
+  )
+
+# results_val
+metrics_val <- metrics_summary |> 
+  pivot_longer(cols = everything(), names_to = c(".metric", ".value"), names_sep = "_") |> 
+  rename(mean = mean, std_err = se)
+```
+
+#### Resultados de la clasificación
+
+Con k = 50 que es el mejor modelo de la validación cruzada. Ahora sí usamos el mismo código de la prueba del principio pero para todos los datos y para k = 50.
+
+-   Para test
+
+```{r}
+#| eval: false
+glcm_r1 <- readRDS("./alzheimer-glcm-matrices/glcm_r1.rds")
+```
+
+```{r}
+#| eval: false
+# Definir la proporción de datos de entrenamiento (80%)
+train_ratio <- 0.8
+
+# Dividir cada lista por categoría en datos de entrenamiento y prueba
+train_data <- test_data <- list()
+
+for (category in names(glcm_r1)) {
+  category_data <- glcm_r1[[category]]
+  n_samples <- length(category_data)
+  
+  # Determinar el número de muestras para entrenamiento y prueba
+  n_train <- round(n_samples * train_ratio)
+  n_test <- n_samples - n_train
+  
+  # Muestrear índices para entrenamiento y prueba
+  train_indexes <- sample(n_samples, n_train)
+  test_indexes <- setdiff(1:n_samples, train_indexes)
+  
+  # Dividir los datos en entrenamiento y prueba
+  train_data[[category]] <- category_data[train_indexes]
+  test_data[[category]] <- category_data[test_indexes]
+}
+
+# Combinar los datos de entrenamiento y prueba de ambas categorías
+train_data_combined <- do.call(c, train_data)
+test_data_combined <- do.call(c, test_data)
+
+rm(category_data, n_samples, n_train, n_test, train_indexes, test_indexes, train_data, test_data)
+```
+
+```{r}
+#| eval: false
+# Definir la función de distancia de Frobenius
+frobenius_distance <- function(mat1, mat2) {
+  sqrt(sum((mat1 - mat2)^2))
+}
+
+# Función FROB_KNN actualizada para incluir la categoría real del test data
+FROB_KNN <- function(train_data, test_data, k_values) {
+  predictions <- map_df(test_data, function(test_item) {
+    new_input_matrix <- test_item$matrix
+    distances <- map_dbl(train_data, ~ {
+      train_item_matrix <- .$matrix
+      frobenius_distance(train_item_matrix, new_input_matrix)
+    })
+    
+    sorted_indices <- order(distances)
+    sorted_labels <- map_chr(train_data[sorted_indices], ~ .$category)
+    closest_labels <- sorted_labels[1:max(k_values)]
+
+    result <- map_df(k_values, function(k) {
+      labels_k <- closest_labels[1:k]
+      most_frequent_label <- names(which.max(table(labels_k)))
+      probability <- sum(labels_k == "demented") / k
+      
+      data.frame(
+        k = k,
+        prediction = most_frequent_label,
+        probability = probability,
+        real_category = test_item$category
+      )
+    })
+    result
+  })
+  return(predictions)
+}
+
+# Ejecutar FROB_KNN con los datos variados y un k_value
+k_values <- 50 # Puedes probar con diferentes valores de k
+example_predictions <- FROB_KNN(train_data = train_data_combined, test_data = test_data_combined, k_values = k_values)
+
+# Verificar las predicciones
+print(example_predictions)
+```
+
+```{r}
+#| eval: false
+
+# Función para calcular la matriz de confusión y las métricas
+calculate_metrics <- function(predictions) {
+  # Asegurarse de que 'prediction' y 'real_category' sean factores con los mismos niveles
+  levels <- union(unique(predictions$prediction), unique(predictions$real_category))
+  predictions$prediction <- factor(predictions$prediction, levels = levels)
+  predictions$real_category <- factor(predictions$real_category, levels = levels)
+  
+  confusion <- confusionMatrix(data = predictions$prediction, reference = predictions$real_category)
+  
+  # Crear el data frame con todas las métricas
+  metrics <- data.frame(
+    sensitivity = confusion$byClass["Sensitivity"],
+    specificity = confusion$byClass["Specificity"],
+    accuracy = confusion$overall["Accuracy"],
+    kappa = confusion$overall["Kappa"]
+  )
+  return(metrics)
+}
+
+# Calcular AUC
+# Define una función para calcular el AUC
+calculate_auc <- function(predictions) {
+  roc_obj <- roc(ifelse(predictions$real_category == "demented", 1, 0), as.numeric(predictions$probability))
+  auc_value <- as.numeric(auc(roc_obj))
+  return(data.frame(AUC = auc_value))
+}
+
+# Calcular el AUC para cada valor de k
+AUC_df <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_auc(.))
+
+# Calcular las métricas para cada valor de k
+metrics <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_metrics(.))
+
+# Unir AUC con las métricas
+metrics_test <- left_join(metrics, AUC_df, by = "k")
+```
+
+-   Para train:
+
+```{r}
+#| eval: false
+# Ejecutar FROB_KNN con los datos variados y un k_value
+k_values <- 50 
+example_predictions_train <- FROB_KNN(train_data = train_data_combined, test_data = train_data_combined, k_values = k_values)
+
+# Verificar las predicciones
+print(example_predictions)
+```
+
+```{r}
+#| eval: false
+# Calcular el AUC para cada valor de k
+AUC_df <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_auc(.))
+
+# Calcular las métricas para cada valor de k
+metrics <- example_predictions |> 
+  group_by(k) |> 
+  do(calculate_metrics(.))
+
+# Unir AUC con las métricas
+metrics_train <- left_join(metrics, AUC_df, by = "k")
+```
+
+```{r}
+#| eval: false
+# Guardar resultados
+# Crear una lista para almacenar los datos
+results_KNN_frob <- list(
+  metrics_train_saved = metrics_train,
+  metrics_test_saved = metrics_test,
+  metrics_val_saved = metrics_val
+)
+
+# Guardar los resultados en un archivo .rdata
+save(results_KNN_frob, file = "./metricas/results_KNN_frob.RData")
+```
+
+Calculo las curvas ROC:
+
+```{r}
+roc_KNN_frob <- list(
+  example_predictions_saved = example_predictions,
+  example_predictions_train_saved = example_predictions_train
+)
+
+# Guardar los resultados en un archivo .rdata
+save(roc_KNN_frob, file = "./metricas/roc_KNN_frob.RData")
+```
+
+```{r}
+load("./metricas/roc_KNN_frob.RData")
+
+example_predictions <- roc_KNN_frob$example_predictions_saved
+
+# Calcular la curva ROC
+roc_obj_test <- roc(ifelse(example_predictions$real_category == "demented", 1, 0), as.numeric(example_predictions$probability))
+
+roc_obj_train <- roc(ifelse(example_predictions_train$real_category == "demented", 1, 0), as.numeric(example_predictions_train$probability))
+
+# Visualizar la curva ROC
+plot(roc_obj, legacy.axes = TRUE)
+
+plot(roc_obj_train, col = "black", legacy.axes = TRUE)
+plot(roc_obj_test, add = TRUE, col = "red", legacy.axes = TRUE)
+legend("bottomright", legend = c("Train", "Test"), col = c("black", "red"), lwd = 2)
+```
+
+Muestro los resultados de cada uno de ellos:
+
+```{r}
+load("./metricas/results_KNN_frob.RData")
+
+metrics_train <- results_KNN_frob$metrics_train_saved
+metrics_test <- results_KNN_frob$metrics_test_saved
+metrics_val <- results_KNN_frob$metrics_val_saved
+
+train <- metrics_train |> 
+  ungroup() |> 
+  rename(auc = AUC, sens = sensitivity, spec = specificity, kap = kappa) |> 
+  mutate(datos = "train") |> 
+  select(datos, accuracy, auc, sens, spec, kap)
+
+test <- metrics_test |> 
+  ungroup() |> 
+  rename(auc = AUC, sens = sensitivity, spec = specificity, kap = kappa) |> 
+  mutate(datos = "test") |> 
+  select(datos, accuracy, auc, sens, spec, kap)
+
+val <- metrics_val |> 
+  select(-std_err) |> 
+  pivot_wider(names_from = .metric, values_from = mean) |> 
+  rename(auc = AUC, sens = sensitivity, spec = specificity, kap = kappa) |> 
+  mutate(datos = "validación") |> 
+  select(datos, accuracy, auc, sens, spec, kap)
+
+val_std <- metrics_val |> 
+  select(-mean) |> 
+  pivot_wider(names_from = .metric, values_from = std_err) |> 
+  rename(auc = AUC, sens = sensitivity, spec = specificity, kap = kappa) |> 
+  mutate(datos = "std error") |> 
+  select(datos, accuracy, auc, sens, spec, kap)
+
+# Convertir la columna auc a <double> en todos los data frames
+val <- val |>  mutate(auc = as.double(auc))
+val_std <- val_std |>  mutate(auc = as.double(auc))
+train <- train |>  mutate(auc = as.double(auc))
+test <- test |>  mutate(auc = as.double(auc))
+
+tabla_final <- bind_rows(val, val_std, train, test) |> 
+  mutate(across(accuracy:kap, ~ round(.x, 3)))
+
+tabla_final
+```
