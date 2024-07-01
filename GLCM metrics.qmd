@@ -1,0 +1,232 @@
+---
+title: "Extracción GLCM"
+format: html
+editor: visual
+---
+
+```{r}
+rm(list = ls())
+library(GLCMTextures) # para sacar la matriz GLCM
+library(imager) # para cargar las imágenes
+library(tidyverse)
+library(purrr)
+library(tidymodels)
+library(readr)
+library(ggplot2)
+library(corrplot)
+library(performance)
+library(FactoMineR)
+library(factoextra)
+library(ClustOfVar)
+library(rpart.plot)
+```
+
+## Matrices de píxeles
+
+```{r}
+
+carpeta_principal <- "alzheimer-mri-dataset"
+subcarpetas <- c("Mild_Demented", "Very_Mild_Demented", "Non_Demented", "Moderate_Demented")
+
+# Cargar imágenes y convertirlas en matrices en una lista con nombres
+matrices_subcarpeta <- set_names(
+  map(subcarpetas, function(subcarpeta) {
+    ruta_subcarpeta <- file.path(carpeta_principal, subcarpeta)
+    archivos_en_subcarpeta <- list.files(path = ruta_subcarpeta, full.names = TRUE)
+    
+    map(archivos_en_subcarpeta, function(archivo) {
+      imagen <- load.image(archivo)
+      as.matrix(imagen) * 255
+    })
+  }),
+  subcarpetas
+)
+
+# Liberar espacio de memoria
+rm(carpeta_principal)
+saveRDS(matrices_subcarpeta[["Non_Demented"]], file = "./alzheimer-grey-images/non-demented.rds")
+saveRDS(matrices_subcarpeta[["Moderate_Demented"]], file = "./alzheimer-grey-images/moderate-demented.rds")
+saveRDS(matrices_subcarpeta[["Mild_Demented"]], file = "./alzheimer-grey-images/mild-demented.rds")
+saveRDS(matrices_subcarpeta[["Very_Mild_Demented"]], file = "./alzheimer-grey-images/very-mild-demented.rds")
+```
+
+```{r}
+length(matrices_subcarpeta[["Non_Demented"]]) length(matrices_subcarpeta[["Moderate_Demented"]]) length(matrices_subcarpeta[["Very_Mild_Demented"]]) length(matrices_subcarpeta[["Mild_Demented"]]) rm(matrices_subcarpeta)
+```
+
+```{r}
+non_demented <- read_rds(file = "./alzheimer-grey-images/non-demented.rds")
+names(non_demented) <- glue::glue("non_demented_{1:length(non_demented)}")
+
+moderate_demented <- read_rds(file = "./alzheimer-grey-images/moderate-demented.rds")
+names(moderate_demented) <- glue::glue("moderate_demented_{1:length(moderate_demented)}")
+
+very_mild_demented <- read_rds(file = "./alzheimer-grey-images/very-mild-demented.rds")
+names(very_mild_demented) <- glue::glue("very_mild_demented_{1:length(very_mild_demented)}")
+
+mild_demented <- read_rds(file = "./alzheimer-grey-images/mild-demented.rds")
+names(mild_demented) <- glue::glue("mild_demented_{1:length(mild_demented)}")
+
+# Juntamos todas
+mri_grey <- list(non_demented, moderate_demented, very_mild_demented, mild_demented)
+names(mri_grey) <- c("non_demented", "moderate_demented",
+                     "very_mild_demented", "mild_demented")
+
+# Ahorramos memoria
+rm(non_demented)
+rm(moderate_demented)
+rm(very_mild_demented)
+rm(mild_demented)
+```
+
+```{r}
+# con función manual_glcm, probamos solamente radio 1
+# añadimos la condición de si shift tiene dimension 2 para distinguir entre los inputs de shift y radius
+
+shifts <- list(c(1,0), c(-1,0), c(0,1), c(0,-1),
+               c(1,1), c(-1,1), c(1,-1), c(-1,-1), 1)
+  
+glcm_metrics <- c()
+
+for (s in 1:length(shifts)) {
+  
+  for (category in names(mri_grey)) {
+    
+    glcm_shift <- NULL
+    
+    if(length(shifts[[s]]) == 2) {
+      glcm_shift <- 
+        mri_grey[[category]] |> 
+        map_dfr(function(x) { manual_glcm(x, shift = shifts[[s]], normalize = TRUE) }) |> 
+        mutate(category = category, shift = paste(shifts[[s]], collapse = "-"))
+    } else {
+      glcm_shift <- 
+        mri_grey[[category]] |> 
+        map_dfr(function(x) { manual_glcm(x, radius = shifts[[s]], type = "radial", normalize = TRUE) }) |> 
+        mutate(category = category, shift = paste(shifts[[s]], collapse = "-"))
+  }
+  
+  bind_rows(glcm_shift)
+  
+  glcm_shift <- 
+    glcm_shift |>
+    rowid_to_column(var = "id_img")
+  
+  glcm_metrics <-
+    glcm_metrics |> 
+    bind_rows(glcm_shift)
+  }
+}   
+
+# Los ordenamos por jerarquía de menos a más demencia
+glcm_metrics <-
+  glcm_metrics |> 
+  mutate(category =
+           factor(category, levels = c("non_demented", "moderate_demented",
+                                       "mild_demented", "very_mild_demented"),
+                  ordered = TRUE)) |>
+  relocate(category, .after = "id_img")
+
+glcm_metrics |> count(category, shift)
+glcm_metrics |> count(id_img)
+glcm_metrics |> filter(shift == 1)
+```
+
+```{r}
+# Para guardarlas
+write_csv(glcm_metrics, "./matrices-glcm/matriz_all.csv")
+write_csv(glcm_metrics |> filter(shift == "1-0"),
+          "./matrices-glcm/matriz_c10.csv")
+write_csv(glcm_metrics |> filter(shift == "1-1"),
+          "./matrices-glcm/matriz_c11.csv")
+write_csv(glcm_metrics |> filter(shift == "1--1"),
+          "./matrices-glcm/matriz_c1_1.csv")
+write_csv(glcm_metrics |> filter(shift == "0-1"),
+          "./matrices-glcm/matriz_c01.csv")
+write_csv(glcm_metrics |> filter(shift == "0--1"),
+          "./matrices-glcm/matriz_c0_1.csv")
+write_csv(glcm_metrics |> filter(shift == "-1--1"),
+          "./matrices-glcm/matriz_c_1_1.csv")
+write_csv(glcm_metrics |> filter(shift == "-1-1"),
+          "./matrices-glcm/matriz_c_11.csv")
+write_csv(glcm_metrics |> filter(shift == "-1-0"),
+          "./matrices-glcm/matriz_c_10.csv")
+write_csv(glcm_metrics |> filter(shift == "1"),
+          "./matrices-glcm/matriz_r1.csv")
+rm(glcm_metrics)
+```
+
+Si lo tenemos ya preprocesado podemos **cargar directamente las matrices glcm**
+
+```{r}
+glcm_metrics <-
+  read_csv(file = "./matrices-glcm/matriz_all.csv") |> 
+  mutate(category =
+           factor(category, levels = c("non_demented", "moderate_demented",
+                                       "mild_demented", "very_mild_demented"),
+                  ordered = TRUE))
+glcm_metrics |> count(category, shift)
+glcm_metrics |> count(id_img)
+```
+
+Viendo el como funciona el paquete `{GLCMTextures}`, dado que cada píxel cuenta tanto como focal como vecino, la matriz glcm es la misma, por ejemplo, para `shift = c(1,0)` que para `shift = c(-1,0)`, es decir solamente tenemos 4 direcciones en vez de 8: c(1,0), c(0,1), c(1,1), c(1,-1). También se selecciona la dirección radial `shift = 1`.
+
+```{r}
+glcm_metrics_filter <-
+  glcm_metrics |>
+  filter(shift %in% c("0-1", "1-1", "1-0", "1--1", "1"))
+glcm_metrics_filter |> count(category, shift)
+glcm_metrics_filter |> count(id_img)
+```
+
+A partir de estos se van a crear 8 datasets
+
+-   5 datasets, una por dirección
+
+```{r}
+matriz_c10 <-
+  glcm_metrics_filter  |>
+  filter(shift == "1-0") |> 
+  select(-shift)
+matriz_c01 <-
+  glcm_metrics_filter  |>
+  filter(shift == "0-1") |> 
+  select(-shift)
+matriz_c11 <-
+  glcm_metrics_filter  |>
+  filter(shift == "1-1") |> 
+  select(-shift)
+matriz_c1_1 <-
+  glcm_metrics_filter  |>
+  filter(shift == "1--1") |> 
+  select(-shift)
+matriz_r1 <-
+  glcm_metrics_filter  |>
+  filter(shift == "1") |> 
+  select(-shift)
+```
+
+-   un dataset total que contiene las variables de todos los shifts, es decir tendrá 1 columna de categoría + 1 columna id de la imagen + 5 matrices x 9 características GLCM. Un total de 47 columnas.
+
+```{r}
+matriz_total <-
+  tibble(matriz_c10 |> 
+           rename_with(function(x) { paste0(x, "-c10")}),
+         matriz_c01 |> select(-id_img, -category) |> 
+           rename_with(function(x) { paste0(x, "-c01")}),
+        matriz_c11 |> select(-id_img, -category) |> 
+           rename_with(function(x) { paste0(x, "-c11")}), 
+        matriz_c1_1 |> select(-id_img, -category) |> 
+           rename_with(function(x) { paste0(x, "-c1-1")}),
+        matriz_r1 |> select(-id_img, -category) |>
+           rename_with(function(x) { paste0(x, "-r1")})) |>
+  rename("id_img" = "id_img-c10", "category" = "category-c10") |> 
+  relocate(category, .after = "id_img")
+matriz_total
+```
+
+```{r}
+#| eval: false
+
+write_csv(matriz_total, "./matrices-glcm/matriz_total.csv")
+```
