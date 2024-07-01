@@ -10,10 +10,14 @@ El método se basa en la extracción de métricas de la **matriz de co-ocurrenci
 
 ### 1. Extracción de características
 
+Ver archivo **Extraccion_GLCM.qmd**.
+
 Se han extraído las características de las imágenes a partir del paquete *GLCM:Textures*. Se ha creado una dirección adicional llamada *radial* que resume las direcciones individuales.
-Se obtienen 9 métrica GLCM: *Contrast, Homogeneity, Dissimilarity, Entropy, Variance, Mean, Correlation, ASM, SA*. Se consturyen dos datasets iniciales, uno para la dirección radial (6400 observaciones, 9 variables) y otro para el conjunto de todas las direcciones individuales (6400 observaciones, 9 x 5 = 45 variables).
+Se obtienen 9 métrica GLCM: *Contrast, Homogeneity, Dissimilarity, Entropy, Variance, Mean, Correlation, ASM, SA*. Se consturyen dos datasets iniciales, uno para la dirección radial (6400 observaciones, 9 variables) y otro para el conjunto de todas las direcciones individuales (6400 observaciones, 9 x 5 = 45 variables). 
 
 ### 2. Análisis de variables
+
+Ver archivo **ANALISIS y CLASIFICACION.qmd**
 
 Se hace un análisis de variables a partir de: matriz de correlación, PCA, análisis VIF y clúster de variables. Las conclusiones extraídas son que las métricas GLCM se agrupan en 3 categorías. Se plantean dos datasets para la clasificación:
 
@@ -24,7 +28,9 @@ Además para la clasificación se harán pruebas con los *datasets* completos de
 
 ### 3. Clasificación
 
-- **KNN**: con el dataset de PCA radial y variables seleccionadas. Se inlcuyen las pruebas de: dirección radial, todas las direcciones, PCA radial sin Correlation, PCA de todas las direcciones. Adicionalmente, se contruye un código propio de KNN para calcular distancias de Frobenius entre las matrices GLCM de la dirección radial.
+Ver archivo **ANALISIS y CLASIFICACION.qmd**
+
+- **KNN**: con el dataset de PCA radial y variables seleccionadas. Se inlcuyen las pruebas de: dirección radial, todas las direcciones, PCA radial sin Correlation, PCA de todas las direcciones. Adicionalmente, se contruye un código propio de KNN para calcular distancias de Frobenius entre las matrices GLCM de la dirección radial (ver archivo **FROBENIUS.qmd**).
 - **Árbol de decisión**: con el dataset de PCA radial y variables seleccionadas. Se inlcuyen las pruebas de: dirección radial, todas las direcciones, PCA radial sin Correlation, PCA de todas las direcciones.
 - **Random Forest**: con el dataset de todas las direcciones.
 - **Regresión logística**: con el dataset de PCA radial. Se hace un análisis de variables adicional y se realiza la clasificación final con las variables de la dirección radial: *Homogeneity, ASM, Mean y Variance.*
